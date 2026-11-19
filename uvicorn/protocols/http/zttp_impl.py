@@ -20,7 +20,7 @@ from uvicorn._types import (
 )
 from uvicorn.config import Config
 from uvicorn.logging import TRACE_LOG_LEVEL
-from uvicorn.protocols.http.flow_control import HIGH_WATER_LIMIT, FlowControl, service_unavailable
+from uvicorn.protocols.http.flow_control import CLOSE_HEADER, HIGH_WATER_LIMIT, FlowControl, service_unavailable
 from uvicorn.protocols.utils import get_client_addr, get_local_addr, get_path_with_query_string, get_remote_addr, is_ssl
 from uvicorn.server import ServerState
 
@@ -364,6 +364,15 @@ class RequestResponseCycle:
             result = await app(  # type: ignore[func-returns-value]
                 self.scope, self.receive, self.send
             )
+        except asyncio.CancelledError:
+            # The server cancels in-flight tasks once the graceful shutdown
+            # timeout is exceeded. If no response was sent yet, tell the
+            # client to retry instead of resetting the connection.
+            if not self.response_started and not self.disconnected:
+                await self.send_503_response()
+            else:
+                self.transport.close()
+            raise
         except BaseException as exc:
             msg = "Exception in ASGI application\n"
             self.logger.error(msg, exc_info=exc)
@@ -404,6 +413,24 @@ class RequestResponseCycle:
         }
         await self.send(response_body_event)
 
+    async def send_503_response(self) -> None:
+        response_start_event: HTTPResponseStartEvent = {
+            "type": "http.response.start",
+            "status": 503,
+            "headers": [
+                (b"content-type", b"text/plain; charset=utf-8"),
+                (b"connection", b"close"),
+                (b"retry-after", b"0"),
+            ],
+        }
+        await self.send(response_start_event)
+        response_body_event: HTTPResponseBodyEvent = {
+            "type": "http.response.body",
+            "body": b"Service Unavailable",
+            "more_body": False,
+        }
+        await self.send(response_body_event)
+
     # ASGI interface
     async def send(self, message: ASGISendEvent) -> None:
         if self.flow.write_paused and not self.disconnected:
@@ -422,6 +449,9 @@ class RequestResponseCycle:
 
             status = message["status"]
             headers = self.default_headers + list(message.get("headers", []))
+
+            if not self.keep_alive and CLOSE_HEADER not in headers:
+                headers = headers + [CLOSE_HEADER]
 
             bodyless = self.scope["method"] == "HEAD" or status in (204, 304) or status < 200
 

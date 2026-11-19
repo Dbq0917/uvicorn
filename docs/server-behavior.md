@@ -114,6 +114,13 @@ Graceful process shutdowns are particularly important during a restart period. D
 
 Uvicorn handles process shutdown gracefully, ensuring that connections are properly finalized, and all tasks have run to completion. During a shutdown period Uvicorn will ensure that responses and tasks must still complete within the configured timeout periods.
 
+The shutdown sequence is ordered so that in-flight work is drained before the process exits:
+
+* The listening sockets are closed first, so no new connections are accepted.
+* Connections that are not waiting on an HTTP response are closed. Responses that complete after the shutdown began are sent with a `Connection: close` header, so clients know not to reuse the connection and can open a new one - which a load balancer will route to a healthy instance.
+* Remaining in-flight requests and background tasks are waited on, up to `--timeout-graceful-shutdown` seconds.
+* If that timeout is exceeded, the remaining tasks are cancelled. Whenever the response has not started yet, the client is sent a `503 Service Unavailable` response with a `Retry-After` header and the connection is closed cleanly, instead of being reset. This lets clients retry the request against another instance, which is particularly useful during rolling deploys.
+
 ---
 
 ## HTTP Pipelining

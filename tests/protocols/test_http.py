@@ -900,6 +900,57 @@ async def test_shutdown_during_idle(http_protocol_cls: type[HTTPProtocol]):
     assert protocol.transport.is_closing()
 
 
+async def test_shutdown_response_declares_connection_close(http_protocol_cls: type[HTTPProtocol]):
+    app = Response("Hello, world", media_type="text/plain")
+
+    protocol = get_connected_protocol(app, http_protocol_cls)
+    protocol.data_received(SIMPLE_GET_REQUEST)
+    protocol.shutdown()  # type: ignore[attr-defined]
+    await protocol.loop.run_one()
+    assert b"HTTP/1.1 200 OK" in protocol.transport.buffer
+    assert b"connection: close" in protocol.transport.buffer
+    assert protocol.transport.is_closing()
+
+
+async def test_cancelled_asgi_task_sends_503(http_protocol_cls: type[HTTPProtocol]):
+    started = asyncio.Event()
+
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable):
+        started.set()
+        await asyncio.sleep(60)
+
+    protocol = get_connected_protocol(app, http_protocol_cls)
+    protocol.data_received(SIMPLE_GET_REQUEST)
+    runner = asyncio.get_running_loop().create_task(protocol.loop.run_one())
+    await started.wait()
+    runner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await runner
+    assert b"HTTP/1.1 503 Service Unavailable" in protocol.transport.buffer
+    assert b"retry-after: 0" in protocol.transport.buffer
+    assert protocol.transport.is_closing()
+
+
+async def test_cancelled_asgi_task_with_started_response_closes_connection(http_protocol_cls: type[HTTPProtocol]):
+    started = asyncio.Event()
+
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        started.set()
+        await asyncio.sleep(60)
+
+    protocol = get_connected_protocol(app, http_protocol_cls)
+    protocol.data_received(SIMPLE_GET_REQUEST)
+    runner = asyncio.get_running_loop().create_task(protocol.loop.run_one())
+    await started.wait()
+    runner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await runner
+    assert b"HTTP/1.1 200 OK" in protocol.transport.buffer
+    assert b"503" not in protocol.transport.buffer
+    assert protocol.transport.is_closing()
+
+
 async def test_100_continue_sent_when_body_consumed(http_protocol_cls: type[HTTPProtocol]):
     async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable):
         body = b""

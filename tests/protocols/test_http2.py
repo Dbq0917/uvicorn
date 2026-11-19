@@ -749,6 +749,53 @@ async def test_shutdown_twice_is_a_no_op():
     assert protocol.transport.is_closing()
 
 
+async def test_cancelled_asgi_task_sends_503():
+    started = asyncio.Event()
+
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable):
+        started.set()
+        await asyncio.sleep(60)
+
+    protocol = get_connected_protocol(app)
+    client = H2Client()
+
+    stream = client.request(b"GET", b"/")
+    protocol.data_received(client.data_to_send())
+    runner = asyncio.get_running_loop().create_task(protocol.loop.run_one())
+    await started.wait()
+    runner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await runner
+
+    response = client.parse_response(protocol.transport.buffer, stream_id=stream.stream_id)
+    assert response.status == 503
+    assert response.body == b"Service Unavailable"
+    assert (b"retry-after", b"0") in response.headers
+
+
+async def test_cancelled_asgi_task_with_started_response_aborts_stream():
+    started = asyncio.Event()
+
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        started.set()
+        await asyncio.sleep(60)
+
+    protocol = get_connected_protocol(app)
+    client = H2Client()
+
+    stream = client.request(b"GET", b"/")
+    protocol.data_received(client.data_to_send())
+    runner = asyncio.get_running_loop().create_task(protocol.loop.run_one())
+    await started.wait()
+    runner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await runner
+
+    events = client.events(protocol.transport.buffer)
+    assert any(isinstance(event, zttp.RstStream) and event.stream_id == stream.stream_id for event in events)
+
+
 async def test_shutdown_refuses_new_streams_and_closes_after_last_response():
     waiting = asyncio.Event()
     release = asyncio.Event()

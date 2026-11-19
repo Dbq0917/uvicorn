@@ -420,6 +420,15 @@ class RequestResponseCycle:
             result = await app(  # type: ignore[func-returns-value]
                 self.scope, self.receive, self.send
             )
+        except asyncio.CancelledError:
+            # The server cancels in-flight tasks once the graceful shutdown
+            # timeout is exceeded. If no response was sent yet, tell the
+            # client to retry instead of resetting the connection.
+            if not self.response_started and not self.disconnected:
+                await self.send_503_response()
+            else:
+                self.transport.close()
+            raise
         except BaseException as exc:
             msg = "Exception in ASGI application\n"
             self.logger.error(msg, exc_info=exc)
@@ -456,6 +465,21 @@ class RequestResponseCycle:
             }
         )
         await self.send({"type": "http.response.body", "body": b"Internal Server Error", "more_body": False})
+
+    async def send_503_response(self) -> None:
+        await self.send(
+            {
+                "type": "http.response.start",
+                "status": 503,
+                "headers": [
+                    (b"content-type", b"text/plain; charset=utf-8"),
+                    (b"content-length", b"19"),
+                    (b"connection", b"close"),
+                    (b"retry-after", b"0"),
+                ],
+            }
+        )
+        await self.send({"type": "http.response.body", "body": b"Service Unavailable", "more_body": False})
 
     # ASGI interface
     async def send(self, message: ASGISendEvent) -> None:

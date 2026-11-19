@@ -111,3 +111,96 @@ async def test_sigint_deny_request_after_triggered(unused_tcp_port: int, caplog)
             await asyncio.sleep(0.1)  # next tick
             with pytest.raises(httpx2.ConnectError):
                 await client.get(f"http://127.0.0.1:{unused_tcp_port}")
+
+
+@pytest.mark.anyio
+async def test_sigint_under_load_drains_inflight_requests(unused_tcp_port: int):
+    """
+    1. A batch of requests is sent
+    2. Sigint is sent to uvicorn
+    3. Shutdown sequence start
+    4. Requests are finished before timeout_graceful_shutdown=5
+
+    Result: all requests go through, no connection is reset, and responses
+        tell the client that the connection is closing.
+    """
+
+    request_count = 10
+    requests_started = 0
+    all_started = Event()
+
+    async def quick_app(scope, receive, send):
+        nonlocal requests_started
+        requests_started += 1
+        if requests_started == request_count:
+            all_started.set()
+        await asyncio.sleep(0.2)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"done"})
+
+    config = Config(app=quick_app, reload=False, port=unused_tcp_port, timeout_graceful_shutdown=5)
+    server: Server
+    resets = 0
+    with assert_signal(signal.SIGINT):
+        async with run_server(config) as server, httpx2.AsyncClient() as client:
+            requests = [
+                asyncio.create_task(client.get(f"http://127.0.0.1:{unused_tcp_port}")) for _ in range(request_count)
+            ]
+            await all_started.wait()
+            server.handle_exit(sig=signal.SIGINT, frame=None)
+            for request in requests:
+                try:
+                    response = await request
+                except httpx2.RemoteProtocolError:  # pragma: no cover
+                    resets += 1
+                else:
+                    assert response.status_code == 200
+                    assert response.headers["connection"] == "close"
+    assert resets == 0
+
+
+@pytest.mark.anyio
+async def test_sigint_under_load_no_connection_resets(unused_tcp_port: int):
+    """
+    1. A batch of requests is sent
+    2. Sigint is sent to uvicorn
+    3. Shutdown sequence start
+    4. Requests are _NOT_ finished before timeout_graceful_shutdown=1
+
+    Result: no connection is reset. Every client receives a 503 response
+        with a 'retry-after' header, so it can retry against another
+        instance instead of seeing a connection reset.
+    """
+
+    request_count = 10
+    requests_started = 0
+    all_started = Event()
+
+    async def slow_app(scope, receive, send):
+        nonlocal requests_started
+        requests_started += 1
+        if requests_started == request_count:
+            all_started.set()
+        await asyncio.sleep(30)  # outlives the graceful shutdown timeout
+        await send({"type": "http.response.start", "status": 200, "headers": []})  # pragma: no cover
+        await send({"type": "http.response.body", "body": b"done"})  # pragma: no cover
+
+    config = Config(app=slow_app, reload=False, port=unused_tcp_port, timeout_graceful_shutdown=1)
+    server: Server
+    resets = 0
+    with assert_signal(signal.SIGINT):
+        async with run_server(config) as server, httpx2.AsyncClient() as client:
+            requests = [
+                asyncio.create_task(client.get(f"http://127.0.0.1:{unused_tcp_port}")) for _ in range(request_count)
+            ]
+            await all_started.wait()
+            server.handle_exit(sig=signal.SIGINT, frame=None)
+            for request in requests:
+                try:
+                    response = await request
+                except httpx2.RemoteProtocolError:  # pragma: no cover
+                    resets += 1
+                else:
+                    assert response.status_code == 503
+                    assert "retry-after" in response.headers
+    assert resets == 0
