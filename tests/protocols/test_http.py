@@ -688,6 +688,46 @@ async def test_no_response_returned(http_protocol_cls: type[HTTPProtocol]):
     assert protocol.transport.is_closing()
 
 
+async def test_response_timeout_cancels_application_before_side_effects(
+    http_protocol_cls: type[HTTPProtocol],
+) -> None:
+    database: list[str] = []
+    cancelled = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
+        try:
+            await asyncio.sleep(1)
+            database.append("business record")
+            await Response("Hello, world", media_type="text/plain")(scope, receive, send)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        finally:
+            finished.set()
+
+    protocol = get_connected_protocol(app, http_protocol_cls, timeout_response=0.05)
+    protocol.data_received(SIMPLE_GET_REQUEST)
+    await protocol.loop.run_one()
+
+    assert b"HTTP/1.1 504 Gateway Timeout" in protocol.transport.buffer
+    assert cancelled.is_set()
+    assert finished.is_set()
+    assert database == []
+
+
+async def test_response_timeout_does_not_delay_fast_request(http_protocol_cls: type[HTTPProtocol]) -> None:
+    app = Response("Hello, world", media_type="text/plain")
+
+    protocol = get_connected_protocol(app, http_protocol_cls, timeout_response=5)
+    started = time.monotonic()
+    protocol.data_received(SIMPLE_GET_REQUEST)
+    await protocol.loop.run_one()
+
+    assert time.monotonic() - started < 0.5
+    assert b"HTTP/1.1 200 OK" in protocol.transport.buffer
+
+
 async def test_partial_response_returned(http_protocol_cls: type[HTTPProtocol]):
     async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable):
         await send({"type": "http.response.start", "status": 200})

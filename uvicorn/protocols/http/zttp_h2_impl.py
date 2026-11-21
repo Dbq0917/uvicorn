@@ -60,6 +60,7 @@ class ZttpH2Protocol(asyncio.Protocol):
         # Timeouts
         self.timeout_keep_alive_task: asyncio.TimerHandle | None = None
         self.timeout_keep_alive = config.timeout_keep_alive
+        self.timeout_response = config.timeout_response
 
         # Shared server state
         self.server_state = server_state
@@ -244,6 +245,7 @@ class ZttpH2Protocol(asyncio.Protocol):
             message_event=asyncio.Event(),
             on_response=self.on_response_complete,
             resume_reading=self.resume_reading_if_idle,
+            timeout_response=self.timeout_response,
         )
         self.cycles[event.stream_id] = cycle
 
@@ -349,6 +351,7 @@ class RequestResponseCycle:
         message_event: asyncio.Event,
         on_response: Callable[[int], None],
         resume_reading: Callable[[], None],
+        timeout_response: float | None,
     ) -> None:
         self.scope = scope
         self.conn = conn
@@ -362,6 +365,7 @@ class RequestResponseCycle:
         self.message_event = message_event
         self.on_response = on_response
         self.resume_reading = resume_reading
+        self.timeout_response = timeout_response
 
         # Connection state
         self.disconnected = False
@@ -381,19 +385,26 @@ class RequestResponseCycle:
 
     # ASGI exception wrapper
     async def run_asgi(self, app: ASGI3Application) -> None:
+        timeout_context = asyncio.timeout(self.timeout_response)
         try:
-            result = await app(  # type: ignore[func-returns-value]
-                self.scope, self.receive, self.send
-            )
+            async with timeout_context:
+                result = await app(  # type: ignore[func-returns-value]
+                    self.scope, self.receive, self.send
+                )
         except BaseException as exc:
-            msg = "Exception in ASGI application\n"
-            self.logger.error(msg, exc_info=exc)
-            if not self.response_started:
-                await self.send_500_response()
+            if isinstance(exc, TimeoutError) and timeout_context.expired():
+                await self.handle_response_timeout()
             else:
-                self.abort_stream()
+                msg = "Exception in ASGI application\n"
+                self.logger.error(msg, exc_info=exc)
+                if not self.response_started:
+                    await self.send_500_response()
+                else:
+                    self.abort_stream()
         else:
-            if result is not None:
+            if timeout_context.expired():
+                await self.handle_response_timeout()
+            elif result is not None:
                 msg = "ASGI callable should return None, but returned '%s'."
                 self.logger.error(msg, result)
                 self.abort_stream()
@@ -416,6 +427,30 @@ class RequestResponseCycle:
         self.stream.reset()
         self.transport.write(self.conn.data_to_send())
         self.disconnected = True
+
+    async def handle_response_timeout(self) -> None:
+        self.logger.error("Request timed out after %s seconds.", self.timeout_response)
+        if not self.response_started and not self.disconnected:
+            await self.send_504_response()
+        elif not self.response_complete and not self.disconnected:
+            self.abort_stream()
+
+    async def send_504_response(self) -> None:
+        response_start_event: HTTPResponseStartEvent = {
+            "type": "http.response.start",
+            "status": 504,
+            "headers": [
+                (b"content-type", b"text/plain; charset=utf-8"),
+                (b"content-length", b"15"),
+            ],
+        }
+        await self.send(response_start_event)
+        response_body_event: HTTPResponseBodyEvent = {
+            "type": "http.response.body",
+            "body": b"Gateway Timeout",
+            "more_body": False,
+        }
+        await self.send(response_body_event)
 
     async def send_500_response(self) -> None:
         response_start_event: HTTPResponseStartEvent = {

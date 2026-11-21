@@ -63,6 +63,7 @@ One exception to this might be if your application serves large file downloads, 
 Uvicorn provides the following timeouts:
 
 * Keep-Alive. Defaults to 5 seconds. Between requests, connections must receive new data within this period or be disconnected.
+* Response. Disabled by default. If configured, the request/response task must complete within this period or the application task is cancelled. A "504 Gateway Timeout" response is sent if the response has not started; otherwise the connection is closed. Cancellation is delivered to the application coroutine so work such as database writes does not continue after the response has timed out.
 
 ---
 
