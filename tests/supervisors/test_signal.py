@@ -111,3 +111,48 @@ async def test_sigint_deny_request_after_triggered(unused_tcp_port: int, caplog)
             await asyncio.sleep(0.1)  # next tick
             with pytest.raises(httpx2.ConnectError):
                 await client.get(f"http://127.0.0.1:{unused_tcp_port}")
+
+
+@pytest.mark.anyio
+async def test_sigint_lifespan_shutdown_timeout(unused_tcp_port: int, caplog):
+    """
+    1. Server is started, with a lifespan shutdown hook that never completes.
+    2. Sigint is sent to uvicorn.
+    3. Shutdown sequence starts, in-flight phase finishes, then the lifespan
+       shutdown hook is awaited.
+
+    Result: The server still exits, bounded by timeout_graceful_shutdown=1,
+        instead of waiting on the application shutdown hook forever.
+    """
+
+    shutdown_hook_entered = Event()
+    release_shutdown_hook = Event()
+
+    async def app(scope, receive, send):
+        if scope["type"] == "lifespan":
+            while True:
+                message = await receive()
+                if message["type"] == "lifespan.startup":
+                    await send({"type": "lifespan.startup.complete"})
+                elif message["type"] == "lifespan.shutdown":
+                    shutdown_hook_entered.set()
+                    await release_shutdown_hook.wait()  # hangs until the test releases it
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
+        else:  # pragma: full coverage
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+    config = Config(app=app, reload=False, port=unused_tcp_port, timeout_graceful_shutdown=1)
+    server = Server(config)
+    with assert_signal(signal.SIGINT):
+        task = asyncio.create_task(server.serve())
+        while not server.started:
+            await asyncio.sleep(0.05)
+        server.handle_exit(sig=signal.SIGINT, frame=None)
+        # without a timeout on the lifespan shutdown hook, this would hang forever
+        await asyncio.wait_for(task, timeout=10)
+        assert shutdown_hook_entered.is_set()
+        release_shutdown_hook.set()
+
+    assert "Application shutdown timed out, timeout graceful shutdown exceeded" in caplog.messages

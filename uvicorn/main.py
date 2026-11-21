@@ -308,7 +308,7 @@ def _parse_headers(ctx: click.Context, param: click.Parameter, value: tuple[str,
     "--timeout-graceful-shutdown",
     type=int,
     default=None,
-    help="Maximum number of seconds to wait for graceful shutdown.",
+    help="Maximum number of seconds to wait for graceful shutdown, including the application lifespan shutdown.",
 )
 @click.option(
     "--timeout-worker-healthcheck",

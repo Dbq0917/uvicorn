@@ -305,7 +305,11 @@ class Server:
 
         # Send the lifespan shutdown event, and wait for application shutdown.
         if not self.force_exit:
-            await self.lifespan.shutdown()
+            try:
+                async with asyncio.timeout(self.config.timeout_graceful_shutdown):
+                    await self.lifespan.shutdown()
+            except TimeoutError:
+                logger.error("Application shutdown timed out, timeout graceful shutdown exceeded")
 
     async def _wait_tasks_to_complete(self) -> None:
         # Wait for existing connections to finish sending responses.

@@ -151,4 +151,4 @@ For advanced TLS scenarios that the flags above don't cover (e.g., mutual TLS, c
 ## Timeouts
 
 * `--timeout-keep-alive <int>` - Close Keep-Alive connections if no new data is received within this timeout (in seconds). **Default:** *5*.
-* `--timeout-graceful-shutdown <int>` - Maximum number of seconds to wait for graceful shutdown. After this timeout, the server will start terminating requests.
+* `--timeout-graceful-shutdown <int>` - Maximum number of seconds to wait for graceful shutdown. After this timeout, the server will start terminating requests. The same bound applies while waiting for the application lifespan shutdown to complete, so a shutdown hook that never finishes cannot prevent the process from exiting.
